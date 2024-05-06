@@ -1,0 +1,315 @@
+/****** Tidy Vietnam Veterans data for join to SNZ_UID
+
+Script prepared by: Dan Young 31-01-2024
+
+This script cleans the Vietnam Veterans dataset in the Adhoc database, and joins the agency IDs contained within 
+to snz_uids. 
+
+In particular, we:
+1) Remove duplicate rows from the dataset
+2) Check the internal consistency of agency linkages - that is, does an agency id appear more than once in the
+	Vietnam veterans table, paired with multiple different ids (a 'duplicate id')?
+3) Check the consistency and completeness of linkages to snz_uids - can we link the agency ids, and when we do,
+	do these agree with each other?
+	- Linking to security.concordance (moh_uid, msd_uid), msd_swn (swn, and tested as alternative for msd_uid) 
+4) Apply an approach to choose under which circumstances we will take the snz_uids
+	(When there are no duplicate ids in the row: when there are no inconsistent linkages, even if not all agency IDs link;
+	 When there is a duplicate id in the row: if there are three agency IDs and all link to and agree on the snz_uid)
+
+There are miscellaneous steps throughout the code that summarise or look at the data.
+
+Output tables:
+[IDI_Sandpit].[DL-MAA2023-20].[Vietnam_snz_uids_clean] - containing snz_uids associated with the Vietnam veterans
+
+Input tables used:
+[IDI_Adhoc].[clean_read_NZDF].[vietnam_veterans_2023]
+[IDI_Clean_202210].[msd_clean].[msd_swn]
+[IDI_Clean_202210].[security].[concordance]
+
+
+******/
+
+
+/************ 1) Remove duplicate rows from the dataset ************/
+
+-- Peek at the top of the dataset to help understand structure, etc
+SELECT TOP 10 * FROM [IDI_Adhoc].[clean_read_NZDF].[vietnam_veterans_2023]
+
+
+-- Check uniqueness of entries - there are a small number of rows that are repeated
+SELECT 'Count of rows' AS [Type], COUNT(*) n FROM [IDI_Adhoc].[clean_read_NZDF].[vietnam_veterans_2023]
+UNION 
+SELECT 'Count of distinct rows' AS [Type],COUNT(*) n FROM (SELECT DISTINCT * FROM [IDI_Adhoc].[clean_read_NZDF].[vietnam_veterans_2023]) k
+
+
+/* Run this block to see the duplicate rows
+SELECT j.* FROM (
+SELECT snz_moh_uid, snz_msd_uid, snz_swn_nbr
+		,COUNT(*) n 
+FROM [IDI_Adhoc].[clean_read_NZDF].[vietnam_veterans_2023]  
+GROUP BY snz_moh_uid, snz_msd_uid, snz_swn_nbr 
+) k
+LEFT JOIN [IDI_Adhoc].[clean_read_NZDF].[vietnam_veterans_2023]   j
+ON (j.snz_moh_uid = k.snz_moh_uid OR (k.snz_moh_uid  IS NULL AND j.snz_moh_uid  IS NULL)) 
+AND (j.snz_msd_uid = k.snz_msd_uid OR (k.snz_msd_uid  IS NULL AND j.snz_msd_uid  IS NULL)) 
+AND (j.snz_swn_nbr=k.snz_swn_nbr OR (k.snz_swn_nbr  IS NULL AND j.snz_swn_nbr  IS NULL)) 
+WHERE k.n > 1
+*/
+
+/* NB. We address the situation where individual IDs are duplicated between rows lower down*/
+
+-- Remove duplicates and save it to a temp table (small datasets)
+DROP TABLE IF EXISTS #vets_deduped;
+SELECT DISTINCT * INTO #vets_deduped FROM [IDI_Adhoc].[clean_read_NZDF].[vietnam_veterans_2023]
+
+
+-- Summarise the 'completeness' of the dataset. 
+-- swn and msd ids are almost always present, moh ids are usually present
+SELECT 'Rows identified only by swn' AS [Group], COUNT(*) n FROM #vets_deduped 
+WHERE snz_swn_nbr is not null AND snz_msd_uid is null and snz_moh_uid is null
+UNION 
+SELECT 'Rows identified only by msd' AS [Group], COUNT(*) n FROM #vets_deduped 
+WHERE snz_swn_nbr is null AND snz_msd_uid is not null and snz_moh_uid is null
+UNION
+SELECT 'Rows identified only by moh' AS [Group], COUNT(*) n FROM #vets_deduped
+WHERE snz_swn_nbr is null AND snz_msd_uid is null and snz_moh_uid is not null
+UNION
+SELECT 'Rows identified by swn and msd' AS [Group], COUNT(*) n FROM #vets_deduped
+WHERE snz_swn_nbr is not null AND snz_msd_uid is not null and snz_moh_uid is null
+UNION
+SELECT 'Rows identified by swn and moh' AS [Group], COUNT(*) n FROM #vets_deduped 
+WHERE snz_swn_nbr is not null AND snz_msd_uid is null and snz_moh_uid is not null
+UNION
+SELECT 'Rows identified by msd and moh' AS [Group], COUNT(*) n FROM #vets_deduped 
+WHERE snz_swn_nbr is null AND snz_msd_uid is not null and snz_moh_uid is not null
+UNION
+SELECT 'Rows identified by all three' AS [Group], COUNT(*) n FROM #vets_deduped
+WHERE snz_swn_nbr is not null AND snz_msd_uid is not null and snz_moh_uid is not null
+ORDER BY n DESC
+
+/************ 2) Check the internal consistency of agency linkages ************/
+
+-- Check internal consistency of the agency id linkages
+-- We see a small number of cases where agency ids are paired with multiple different ids from another agency.
+
+/* Can highlight and run these part to get the lists of agency IDs that are duplicated across rows
+
+-- Check msd_uid to moh_uid and swn_nbr
+SELECT * 
+FROM (
+	SELECT snz_msd_uid, COUNT(DISTINCT snz_moh_uid) n_moh, COUNT(DISTINCT snz_swn_nbr) n_swn
+	FROM #vets_deduped
+	WHERE snz_msd_uid is not null
+	GROUP BY snz_msd_uid) k
+WHERE n_moh > 1 OR n_swn > 1
+ 
+ -- Check moh_uid to msd_uid and swn_nbr
+SELECT * 
+FROM (SELECT snz_moh_uid, COUNT(DISTINCT snz_msd_uid) n_msd, COUNT(DISTINCT snz_swn_nbr) n_swn
+		FROM #vets_deduped
+		WHERE snz_moh_uid is not null
+		GROUP BY snz_moh_uid) k
+WHERE n_msd > 1 OR n_swn > 1
+
+-- Check swn_nbr to msd_uid and moh_uid
+SELECT * 
+FROM (SELECT snz_swn_nbr, COUNT(DISTINCT snz_msd_uid) n_msd, COUNT(DISTINCT snz_moh_uid) n_moh
+		FROM #vets_deduped
+		WHERE snz_swn_nbr is not null
+		GROUP BY snz_swn_nbr) k
+WHERE n_msd > 1 OR n_moh > 1
+*/ 
+
+
+-- We won't remove these just yet, but we will create a flag for our ids (bad_id_flag) where the row has an ID that is duplicated in another row
+
+DROP TABLE IF EXISTS #dup_ids_flagged;
+SELECT vt.*
+		,case when msd_to.msd_to_moh is null then 0 else msd_to.msd_to_moh end AS msd_to_moh
+		,case when msd_to.msd_to_swn is null then 0 else msd_to.msd_to_swn end AS msd_to_swn
+		,case when moh_to.moh_to_msd is null then 0 else moh_to.moh_to_msd end AS moh_to_msd
+		,case when moh_to.moh_to_swn is null then 0 else moh_to.moh_to_swn end AS moh_to_swn
+		,case when swn_to.swn_to_moh is null then 0 else swn_to.swn_to_moh end AS swn_to_moh
+		,case when swn_to.swn_to_msd is null then 0 else swn_to.swn_to_msd end AS swn_to_msd
+		,CASE WHEN msd_to.msd_to_moh >=2 
+					OR msd_to.msd_to_swn >=2 
+					OR moh_to.moh_to_msd >=2 
+					OR moh_to.moh_to_swn >=2 
+					OR swn_to.swn_to_moh >=2 
+					OR swn_to.swn_to_msd >=2 
+							THEN 1 ELSE 0 END AS bad_id_flag
+INTO #dup_ids_flagged
+FROM #vets_deduped vt
+
+LEFT JOIN (
+	SELECT snz_msd_uid, COUNT(DISTINCT snz_moh_uid) msd_to_moh, COUNT(DISTINCT snz_swn_nbr) msd_to_swn
+	FROM #vets_deduped
+	WHERE snz_msd_uid is not null
+	GROUP BY snz_msd_uid) msd_to
+ ON vt.snz_msd_uid = msd_to.snz_msd_uid
+
+LEFT JOIN (SELECT snz_moh_uid, COUNT(DISTINCT snz_msd_uid) moh_to_msd, COUNT(DISTINCT snz_swn_nbr) moh_to_swn
+		FROM #vets_deduped
+		WHERE snz_moh_uid is not null
+		GROUP BY snz_moh_uid) moh_to
+ON vt.snz_moh_uid = moh_to.snz_moh_uid
+
+LEFT JOIN (SELECT snz_swn_nbr, COUNT(DISTINCT snz_msd_uid) swn_to_msd, COUNT(DISTINCT snz_moh_uid) swn_to_moh
+		FROM #vets_deduped
+		WHERE snz_swn_nbr is not null
+		GROUP BY snz_swn_nbr) swn_to
+ON vt.snz_swn_nbr = swn_to.snz_swn_nbr
+
+
+/************ 3) Check the consistency and completeness of linkages to snz_uids ************/
+
+-- Next we check our agency uids can be linked to snz_uids and agree on the snz_uid
+
+-- Check that security.concordance and msd_swn agree on msd_uid and snz_uid - or at least do not differ
+-- Conclude: tables are consistent, security concordance is better for us to use
+
+SELECT	CASE WHEN snz_uid_sec_con is NULL AND snz_uid_msd_swn IS NOT NULL THEN 'Only msd_swn table' 
+			 WHEN snz_uid_sec_con IS NOT NULL AND snz_uid_msd_swn IS NULL THEN 'Only security concordance table' 
+			 WHEN snz_uid_sec_con IS  NULL AND snz_uid_msd_swn IS NULL THEN 'Both null' 
+			 WHEN snz_uid_sec_con = snz_uid_msd_swn THEN 'Match'
+			 WHEN snz_uid_sec_con != snz_uid_msd_swn THEN 'Different'
+			 ELSE 'Error' END AS [group]
+		,COUNT(DISTINCT snz_msd_uid) n
+FROM (
+		SELECT vt.snz_msd_uid
+				,conc_msd.snz_uid AS snz_uid_sec_con
+				,conc_msd2.snz_uid AS snz_uid_msd_swn
+		FROM (SELECT DISTINCT snz_msd_uid FROM #vets_deduped) vt
+		LEFT JOIN [IDI_Clean_202210].[security].[concordance] conc_msd
+		ON vt.snz_msd_uid = conc_msd.snz_msd_uid
+		LEFT JOIN [IDI_Clean_202210].[msd_clean].[msd_swn] conc_msd2
+		ON conc_msd2.snz_msd_uid = vt.snz_msd_uid 
+		) k
+GROUP BY CASE WHEN snz_uid_sec_con is NULL AND snz_uid_msd_swn IS NOT NULL THEN 'Only msd_swn table' 
+			 WHEN snz_uid_sec_con IS NOT NULL AND snz_uid_msd_swn IS NULL THEN 'Only security concordance table' 
+			 WHEN snz_uid_sec_con IS  NULL AND snz_uid_msd_swn IS NULL THEN 'Both null' 
+			 WHEN snz_uid_sec_con = snz_uid_msd_swn THEN 'Match'
+			 WHEN snz_uid_sec_con != snz_uid_msd_swn THEN 'Different'
+			 ELSE 'Error' END
+			 
+-- Check that msd_swn agrees on msd_uid and swn_nbr
+-- Conclude: our table is consistent (although not necessarily complete)
+-- N.B. We don't want to see 'Different' or 'Error' appear in our results below
+SELECT	CASE WHEN snz_uid_msd is NULL AND snz_uid_swn IS NOT NULL THEN 'Only swn_nbr matches' 
+			 WHEN snz_uid_msd is NOT NULL AND snz_uid_swn IS NULL  THEN 'Only msd_uid matches' 
+			 WHEN snz_uid_msd is NULL AND snz_uid_swn IS NULL THEN 'Both null' 
+			 WHEN snz_uid_msd = snz_uid_swn THEN 'Match'
+			 WHEN snz_uid_msd != snz_uid_swn THEN 'Different'
+			 ELSE 'Error' END AS [group]
+		,COUNT(DISTINCT snz_msd_uid) n
+FROM (
+		SELECT vt.snz_msd_uid
+				,vt.snz_swn_nbr
+				,conc_msd.snz_uid AS snz_uid_msd
+				,conc_swn.snz_uid AS snz_uid_swn
+		FROM #vets_deduped vt
+		LEFT JOIN [IDI_Clean_202210].[msd_clean].[msd_swn] conc_msd
+		ON vt.snz_msd_uid = conc_msd.snz_msd_uid
+		LEFT JOIN [IDI_Clean_202210].[msd_clean].[msd_swn] conc_swn
+		ON conc_swn.snz_swn_nbr = vt.snz_swn_nbr
+		) k
+GROUP BY CASE WHEN snz_uid_msd is NULL AND snz_uid_swn IS NOT NULL THEN 'Only swn_nbr matches' 
+			 WHEN snz_uid_msd is NOT NULL AND snz_uid_swn IS NULL  THEN 'Only msd_uid matches' 
+			 WHEN snz_uid_msd is NULL AND snz_uid_swn IS NULL THEN 'Both null' 
+			 WHEN snz_uid_msd = snz_uid_swn THEN 'Match'
+			 WHEN snz_uid_msd != snz_uid_swn THEN 'Different'
+			 ELSE 'Error' END
+
+-- Compare results between tables - do we get disagreement on snz_uid between moh/msd/swn ids?
+-- Results table has following additional columns:
+----- (a) n_agency_ids - the number of agency ids (msd, moh, swn) that were available to try to link on (1-3)
+----- (b) n_failures_to_link - the number agency ids that were valid but could not be matched (0-3)
+----- (c) n_linked_snz_uids - the number of agency ids that successfully linked to an snz_uid (0-3)
+----- (d) n_distinct_snz_uids - the number of different snz_uids produced by the linking (0-3)
+
+DROP TABLE IF EXISTS #linkages_checks
+SELECT vt.*
+		,conc_moh.snz_uid AS snz_uid_moh
+		,conc_msd.snz_uid AS snz_uid_msd
+		,conc_swn.snz_uid AS snz_uid_swn
+-- Count of agency ids
+		,CASE WHEN vt.snz_moh_uid IS NULL THEN 0 ELSE 1 END + 
+			CASE WHEN vt.snz_msd_uid IS NULL THEN 0 ELSE 1 END +
+			CASE WHEN vt.snz_swn_nbr IS NULL THEN 0 ELSE 1 END  AS n_agency_ids
+-- Count of failed linkages. Only count where there is a non-NULL agency ID.
+		,CASE WHEN conc_moh.snz_uid IS NULL AND vt.snz_moh_uid IS NOT NULL THEN 1 ELSE 0 END + 
+			CASE WHEN conc_msd.snz_uid IS NULL AND vt.snz_msd_uid IS NOT NULL THEN 1 ELSE 0 END +
+			CASE WHEN conc_swn.snz_uid IS NULL AND vt.snz_swn_nbr IS NOT NULL THEN 1 ELSE 0 END  AS n_failures_to_link	
+-- Count of successful linkages (not-null agency ID and not-null corresponding snz_uid)
+		,CASE WHEN conc_moh.snz_uid IS NOT NULL AND vt.snz_moh_uid IS NOT NULL THEN 1 ELSE 0 END + 
+			CASE WHEN conc_msd.snz_uid IS NOT NULL AND vt.snz_msd_uid IS NOT NULL THEN 1 ELSE 0 END +
+			CASE WHEN conc_swn.snz_uid IS NOT NULL AND vt.snz_swn_nbr IS NOT NULL THEN 1 ELSE 0 END  AS n_linked_snz_uids
+-- Count of different snz_uids. 0 means no successful linkage, 1 is good, 2 and 3 mean 1 or more agency id linkages disagree
+		,CASE WHEN conc_moh.snz_uid IS NULL AND conc_msd.snz_uid IS NULL AND conc_swn.snz_uid IS NULL THEN 0 -- all null = 0
+				WHEN conc_msd.snz_uid = conc_moh.snz_uid AND conc_msd.snz_uid = conc_swn.snz_uid THEN 1 -- all present and match = 1
+				WHEN (conc_msd.snz_uid = conc_moh.snz_uid AND conc_swn.snz_uid IS NULL)
+						OR (conc_moh.snz_uid = conc_swn.snz_uid AND conc_msd.snz_uid IS NULL)
+						OR (conc_msd.snz_uid = conc_swn.snz_uid AND conc_moh.snz_uid IS NULL ) THEN 1 -- two match, other is null
+				WHEN conc_msd.snz_uid != conc_moh.snz_uid AND conc_msd.snz_uid != conc_swn.snz_uid AND conc_moh.snz_uid != conc_swn.snz_uid THEN 3 -- all do not match
+				WHEN conc_msd.snz_uid != conc_moh.snz_uid
+						OR conc_moh.snz_uid != conc_swn.snz_uid 
+						OR conc_msd.snz_uid != conc_swn.snz_uid THEN 2 -- two do not match
+				ELSE 1 END AS n_distinct_snz_uids -- otherwise must be just 1
+INTO #linkages_checks
+FROM #dup_ids_flagged vt
+LEFT JOIN [IDI_Clean_202210].[security].[concordance] conc_moh
+ON vt.snz_moh_uid = conc_moh.snz_moh_uid
+LEFT JOIN [IDI_Clean_202210].[security].[concordance] conc_msd
+ON vt.snz_msd_uid = conc_msd.snz_msd_uid
+LEFT JOIN [IDI_Clean_202210].[msd_clean].[msd_swn] conc_swn
+ON conc_swn.snz_swn_nbr = vt.snz_swn_nbr
+
+
+-- Print a summary of the results.
+-- n_agency_ids is the number of valid (not null) agency ids a row had
+-- n_failures_to_link is how many could not be linked to an snz_uid
+-- n_linked_snz_uids is the number of valid agency ids minus the failures to link
+-- n_distinct_snz_uids is how many different snz_uids were found amongst the linked groups
+-- ideally we want failtures to link to be 0 and n_distinct_snz_uid to be 1.
+-- n_distinct_snz_uid of 0 means there were no successful linkages; and of 2+ means a disgreement.
+-- Recall that bad_id_flag accounts for rows with an ID that appears elsewhere in the data.
+		-- Consider rows where this is 1, and all agency ids agree
+
+SELECT bad_id_flag,n_agency_ids,n_failures_to_link,n_linked_snz_uids, n_distinct_snz_uids, COUNT(*) n
+FROM #linkages_checks 
+GROUP BY bad_id_flag,n_agency_ids,n_failures_to_link,n_linked_snz_uids, n_distinct_snz_uids
+ORDER BY bad_id_flag,n_distinct_snz_uids, n_agency_ids desc, n DESC
+
+/************ 4) Apply an approach to choose under which circumstances we will take the snz_uids ************/
+
+/* Suggested approach:
+Keep the rows where:
+	- at least one agency ID links to an snz_uid; and
+	- all of the linked snz_uids are the same.
+In terms of the rows with bad id flags, we will assume that, if all agency ids link to snz_uids, and all snz_uids
+match, then the row is accurate.
+
+Conversely, we do not keep the rows where:
+	- two or more agency ids that link to snz_uids disagree on the results - we cannot tell which is correct
+	- no agency ID can be linked to an snz_uid - we have no choice but to discard these rows.
+
+n.b. we could decide to include both snz_uids where there is a disagreement between the snz_uids on the assumption that 
+it describes a real person who has been incorrectly linked in the imported dataset; or could look at whether one candidate
+can be ignored (eg, if one was demographically likely, and the other was not born in 1973). However, the number of rows 
+affected is tiny and will not be material affect our analysis, so this has not been pursued.
+
+*/
+
+DROP TABLE IF EXISTS [IDI_Sandpit].[DL-MAA2023-20].[Vietnam_snz_uids_clean]
+SELECT COALESCE(snz_uid_moh,snz_uid_msd,snz_uid_swn) AS snz_uid -- We will only be taking where they agree so can use coalesce
+		,CONCAT(CAST(n_agency_ids AS varchar)
+				,' agency ids - '
+				,CASE WHEN n_failures_to_link = 0 THEN 'all linked - ' ELSE 'one or more failures to link - ' END,
+					CASE WHEN n_distinct_snz_uids = 1 THEN 'all snz_uids agree'
+							WHEN n_distinct_snz_uids = 0 THEN 'no successful linkages'
+							ELSE CONCAT(CAST(n_distinct_snz_uids AS varchar),' snz_uids failed to link') END,
+					CASE WHEN bad_id_flag = 1 THEN ' - id duplicated elsewhere' ELSE '' END) AS match_quality	
+INTO [IDI_Sandpit].[DL-MAA2023-20].[Vietnam_snz_uids_clean]
+FROM #linkages_checks
+WHERE n_distinct_snz_uids = 1 -- only rows where there is a valid snz_uid and there is no disagreement as to who it is
+AND (bad_id_flag = 0 OR (n_failures_to_link = 0 AND n_agency_ids = 3)) -- either there are no issues with ID duplicates, or it is a perfect match
